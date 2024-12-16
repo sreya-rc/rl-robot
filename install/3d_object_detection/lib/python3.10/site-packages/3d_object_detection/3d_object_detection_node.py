@@ -135,21 +135,22 @@ class ObjectDetectionOverlay(Node):
         cv2.waitKey(1)
 
     def publish_tf(self, x, y, z, object_name):
-        # Create a TransformStamped message
         t = geometry_msgs.msg.TransformStamped()
         t.header.stamp = self.get_clock().now().to_msg()
-        t.header.frame_id = "camera_depth_optical_frame"  # Parent frame
-        t.child_frame_id = f"{object_name}_frame"  # Child frame for the detected object
+        t.header.frame_id = "camera_depth_optical_frame"
+        t.child_frame_id = f"{object_name}_frame"
+        
+        # Ensure values are valid float types
         t.transform.translation.x = float(x)
         t.transform.translation.y = float(y)
         t.transform.translation.z = float(z)
-        t.transform.rotation.x = 0.0
-        t.transform.rotation.y = 0.0
-        t.transform.rotation.z = 0.0
-        t.transform.rotation.w = 1.0  # Default rotation (no rotation)
-
-        # Publish the transform
-        self.tf_broadcaster.sendTransform(t)
+        t.transform.rotation.w = 1.0
+        
+        try:
+            self.tf_broadcaster.sendTransform(t)
+            self.get_logger().debug(f"Published transform for {object_name}_frame")
+        except Exception as e:
+            self.get_logger().error(f"Failed to publish transform: {str(e)}")
 
 def main(args=None):
     rclpy.init(args=args)

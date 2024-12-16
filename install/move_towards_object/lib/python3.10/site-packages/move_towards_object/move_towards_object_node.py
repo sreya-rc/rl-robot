@@ -2,68 +2,157 @@ import rclpy
 from rclpy.node import Node
 import tf2_ros
 import geometry_msgs.msg
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import Twist, TransformStamped
 import math
+import numpy as np
+import time
+from .robot_environment import RobotEnvironment
+from .q_learning_agent import QLearningAgent
 
 class MoveTowardsObject(Node):
     def __init__(self):
         super().__init__('move_towards_object')
 
-        # Create a publisher for velocity commands
+        # Create publishers
         self.velocity_publisher = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
+        self.teleport_publisher = self.create_publisher(TransformStamped, '/teleport', 10)
 
-        # Create a TF buffer and listener
-        self.tf_buffer = tf2_ros.Buffer()
+        # Initialize transform buffer and listener
+        self.tf_buffer = tf2_ros.Buffer(cache_time=rclpy.duration.Duration(seconds=60.0))
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
-        # Timer to periodically check the transform and move the robot
+        # Control loop timer
         self.timer = self.create_timer(0.1, self.control_loop)
 
-        # Define the target frame that you want to move towards
-        self.target_frame = 'person_frame'  # Replace with the actual TF child frame name
+        # Initialize RL components with specific dimensions
+        self.environment = RobotEnvironment()
+        self.agent = QLearningAgent(state_dim=2, action_dim=2)
+
+        # Initialize state
+        self.current_state = self.environment.reset()
+
+        # Training parameters
+        self.episode_count = 0
+        self.max_episodes = 1000
+        self.episode_steps = 0
+        self.max_steps_per_episode = 500
+
+        # Performance tracking
+        self.cumulative_reward = 0.0
+
+        # Debug parameters
+        self.debug = True
+
+    def publish_transform(self):
+        # Publish current robot position as transform
+        t = TransformStamped()
+        t.header.stamp = self.get_clock().now().to_msg()
+        t.header.frame_id = 'map'
+        t.child_frame_id = 'base_link'
+        current_pos = self.environment.current_position
+        t.transform.translation.x = float(current_pos[0])
+        t.transform.translation.y = float(current_pos[1])
+        t.transform.translation.z = float(current_pos[2])
+        # Set rotation (simplified - only yaw)
+        t.transform.rotation.w = 1.0
+        self.tf_broadcaster.sendTransform(t)
+
+    def teleport_to_start(self):
+        teleport = TransformStamped()
+        teleport.header.stamp = self.get_clock().now().to_msg()
+        teleport.header.frame_id = 'map'
+        teleport.child_frame_id = 'base_link'
+        # Set position to robot start position
+        start_pos = self.environment.robot_start_position
+        teleport.transform.translation.x = float(start_pos[0])
+        teleport.transform.translation.y = float(start_pos[1])
+        teleport.transform.translation.z = float(start_pos[2])
+        # Set rotation to default
+        teleport.transform.rotation.w = 1.0
+        # Publish teleport transform
+        self.teleport_publisher.publish(teleport)
+        # Add delay to ensure teleport completes
+        time.sleep(0.5)  # Add small delay
+        # Stop the robot
+        stop_cmd = Twist()
+        self.velocity_publisher.publish(stop_cmd)
+        self.get_logger().info(f'Teleporting to: {self.environment.robot_start_position}')
 
     def control_loop(self):
         try:
-            # Look up the latest transform from the target object to the camera frame
-            trans = self.tf_buffer.lookup_transform('camera_depth_optical_frame', self.target_frame, rclpy.time.Time())
+            # Publish current robot position
+            self.publish_transform()
 
-            # Extract the translation components (x, y, z)
-            x = trans.transform.translation.x
-            y = trans.transform.translation.y
+            # Get action from RL agent
+            action = self.agent.get_action(self.current_state)
 
-            # Calculate distance and angle to the target
-            distance = math.sqrt(x**2 + y**2)
-            angle_to_target = math.atan2(y, x)
+            # Execute action and get new state
+            next_state, reward, done = self.environment.step(action)
 
-            # Define a Twist message to move the robot
+            # Update cumulative reward
+            self.cumulative_reward += reward
+
+            # Create and publish velocity command
             twist = Twist()
-
-            print("[DEBUG] Angle to target: ", angle_to_target)
-            print("[DEBUG] Distance to target: ", distance)
-
-            # Move forward if the target is not too close
-            if distance > 0.04:  # Stop if we're within 0.5 meters of the target
-                twist.linear.x = 0.2 * distance  # Scale speed by distance
-                twist.angular.z = 0.1 * angle_to_target  # Turn towards the target
-            else:
-                print("Too close to person !")
-                twist.linear.x = 0.0
-                twist.angular.z = 0.0
-
-            # Publish the Twist message to move the robot
+            twist.linear.x = float(action[0])  # Forward/backward
+            twist.angular.z = float(action[1])  # Rotation
             self.velocity_publisher.publish(twist)
 
-        except tf2_ros.LookupException:
-            self.get_logger().warn(f"Could not find transform from camera_depth_optical_frame to {self.target_frame}")
-        except tf2_ros.ExtrapolationException as e:
-            self.get_logger().warn(f"Extrapolation error: {str(e)}")
+            # Update Q-table
+            self.agent.update_q_table(self.current_state, action, reward, next_state)
+
+            # Update current state
+            self.current_state = next_state
+
+            # Increment step counter
+            self.episode_steps += 1
+
+            if self.debug:
+                self.get_logger().info(
+                    f'Step: {self.episode_steps}, ' +
+                    f'State: [{self.current_state[0]:.2f}, {self.current_state[1]:.2f}], ' +
+                    f'Action: [{action[0]:.2f}, {action[1]:.2f}], ' +
+                    f'Reward: {reward:.2f}'
+                )
+
+            # Check if episode should end
+            if done or self.episode_steps >= self.max_steps_per_episode:
+                self.episode_count += 1
+                self.get_logger().info(
+                    f'Episode {self.episode_count} completed with ' +
+                    f'cumulative reward: {self.cumulative_reward:.2f}'
+                )
+                self.agent.epsilon = max(0.01, self.agent.epsilon * 0.995)
+                self.get_logger().info(f'Updated epsilon: {self.agent.epsilon:.4f}')
+
+                # Teleport robot back to start
+                self.teleport_to_start()
+
+                # Reset for next episode
+                self.current_state = self.environment.reset()
+                self.episode_steps = 0
+                self.cumulative_reward = 0.0
+
+                # Check if training is complete
+                if self.episode_count >= self.max_episodes:
+                    self.get_logger().info('Training completed!')
+                    self.timer.cancel()
+
+        except Exception as e:
+            self.get_logger().error(f'Error in control loop: {str(e)}')
 
 def main(args=None):
     rclpy.init(args=args)
-    node = MoveTowardsObject()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+    try:
+        node = MoveTowardsObject()
+        rclpy.spin(node)
+    except Exception as e:
+        print(f"Error in main: {str(e)}")
+    finally:
+        if 'node' in locals():
+            node.destroy_node()
+        rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
